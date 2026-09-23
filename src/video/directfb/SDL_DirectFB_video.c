@@ -213,6 +213,12 @@ static int DirectFB_VideoInit(_THIS)
 
     SDL_DFB_CHECKERR(DirectFBInit(NULL, NULL));
 
+    /* A console-owning application needs SDL_QUIT on SIGINT/SIGTERM in order
+     * to restore its lease. Keep upstream DirectFB handling unless requested. */
+    if (!SDL_GetHintBoolean("SDL_DIRECTFB_HANDLE_SIGNALS", SDL_TRUE)) {
+        SDL_DFB_CHECKERR(DirectFBSetOption("no-sighandler", NULL));
+    }
+
     /* avoid switching to the framebuffer when we
      * are running X11 */
     ret = readBoolEnv(DFBENV_USE_X11_CHECK , 1);

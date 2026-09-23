@@ -91,6 +91,9 @@ this should probably be removed at some point in the future.  --ryan. */
 
 #if !SDL_RENDER_DISABLED
 static const SDL_RenderDriver *render_drivers[] = {
+#if SDL_VIDEO_RENDER_RGA
+    &RGA_RenderDriver,
+#endif
 #if SDL_VIDEO_RENDER_D3D
     &D3D_RenderDriver,
 #endif

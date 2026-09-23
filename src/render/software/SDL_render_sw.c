@@ -35,6 +35,20 @@
 #include "SDL_rotate.h"
 #include "SDL_triangle.h"
 
+#if SDL_VIDEO_RENDER_RGA
+#include <fcntl.h>
+#include <linux/dma-buf.h>
+#include <linux/dma-heap.h>
+#include <rga/im2d.h>
+#include <rga/rga.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#if SDL_VIDEO_DRIVER_DIRECTFB
+#include "../../video/directfb/SDL_DirectFB_window.h"
+#endif
+#endif
+
 /* SDL surface based renderer implementation */
 
 typedef struct
@@ -44,11 +58,405 @@ typedef struct
     SDL_bool surface_cliprect_dirty;
 } SW_DrawStateCache;
 
+#if SDL_VIDEO_RENDER_RGA
+typedef struct RGA_TextureData
+{
+    SDL_Texture *texture;
+    int fd;
+    void *pixels;
+    size_t bytes;
+    int pitch;
+    int format;
+    SDL_bool dirty;
+    SDL_bool cpu_access;
+    rga_buffer_handle_t handle;
+    SDL_Surface *scaled;
+    SDL_Rect scale_source;
+    int scale_width, scale_height;
+    SDL_bool scale_seen;
+    struct RGA_TextureData *next;
+} RGA_TextureData;
+#endif
+
 typedef struct
 {
     SDL_Surface *surface;
     SDL_Surface *window;
+#if SDL_VIDEO_RENDER_RGA
+    int rga_fd;
+    size_t rga_bytes;
+    void *rga_pixels;
+    RGA_TextureData *rga_textures;
+    int fill_fd;
+    void *fill_pixels;
+    size_t fill_bytes;
+    Uint32 fill_color;
+    SDL_bool fill_valid;
+    SDL_bool rga_force;
+    SDL_bool rga_cache;
+    SDL_bool rga_cpu_access;
+    SDL_bool fill_cpu_access;
+    rga_buffer_handle_t rga_handle;
+    rga_buffer_handle_t fill_handle;
+    Uint64 rga_fill_count;
+    Uint64 rga_alpha_count;
+    Uint64 rga_copy_count;
+    Uint64 rga_rotate_count;
+    Uint64 rga_cache_count;
+    Uint64 rga_import_count;
+    size_t scale_cache_bytes;
+#endif
 } SW_RenderData;
+
+#if SDL_VIDEO_RENDER_RGA
+/* The CPU and RGA share a DMA heap buffer. A surface allocated by DirectFB
+ * cannot be assumed to be importable by RGA on the Lyra's no-MMU RGA2. */
+static int RGA_Sync(int fd, Uint64 flags)
+{
+    struct dma_buf_sync sync;
+    sync.flags = flags;
+    return ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+}
+
+/* Ownership changes, not draw calls, delimit CPU cache maintenance. All
+ * hardware submissions remain synchronous, including SDL_RenderFlush. */
+static int RGA_Access(int fd, SDL_bool *cpu_access, SDL_bool cpu)
+{
+    if (*cpu_access != cpu) {
+        if (RGA_Sync(fd, (cpu ? DMA_BUF_SYNC_START : DMA_BUF_SYNC_END) | DMA_BUF_SYNC_RW) < 0) {
+            return SDL_SetError("RGA: DMA ownership transition failed");
+        }
+        *cpu_access = cpu;
+    }
+    return 0;
+}
+
+static int RGA_CPU(SW_RenderData *data)
+{
+    return data->rga_fd < 0 ? 0 : RGA_Access(data->rga_fd, &data->rga_cpu_access, SDL_TRUE);
+}
+
+static rga_buffer_handle_t RGA_Import(int pitch, int height, int format, int fd)
+{
+    im_handle_param_t param;
+    SDL_zero(param);
+    param.width = pitch / (format == RK_FORMAT_RGB_565 ? 2 : 4);
+    param.height = height;
+    param.format = format;
+    return importbuffer_fd(fd, &param);
+}
+
+static rga_buffer_t RGA_Buffer(rga_buffer_handle_t handle, int fd, int width,
+                                int height, int stride, int format)
+{
+    /* Older drivers may not support persistent imports. */
+    return handle ? wrapbuffer_handle_t(handle, width, height, stride, height, format) :
+                    wrapbuffer_fd_t(fd, width, height, stride, height, format);
+}
+
+static int RGA_Allocate(int width, int height, int bytes_per_pixel,
+                        int *fd, void **pixels, int *pitch, size_t *bytes)
+{
+    struct dma_heap_allocation_data alloc;
+    int heap;
+
+    if (width < 2 || height < 2 || width > 1280 || height > 1280 ||
+        (bytes_per_pixel != 2 && bytes_per_pixel != 4)) {
+        return -1;
+    }
+    *pitch = (width * bytes_per_pixel + 3) & ~3;
+    *bytes = (size_t)*pitch * (size_t)height;
+    heap = open("/dev/dma_heap/linux,cma", O_RDWR | O_CLOEXEC);
+    if (heap < 0) {
+        return -1;
+    }
+    SDL_zero(alloc);
+    alloc.len = *bytes;
+    alloc.fd_flags = O_RDWR | O_CLOEXEC;
+    if (ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &alloc) < 0) {
+        close(heap);
+        return -1;
+    }
+    close(heap);
+    *fd = (int)alloc.fd;
+    *pixels = mmap(NULL, *bytes, PROT_READ | PROT_WRITE, MAP_SHARED, *fd, 0);
+    if (*pixels == MAP_FAILED) {
+        close(*fd);
+        *fd = -1;
+        return -1;
+    }
+    if (RGA_Sync(*fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW) < 0) {
+        munmap(*pixels, *bytes);
+        close(*fd);
+        *fd = -1;
+        return -1;
+    }
+    SDL_memset(*pixels, 0, *bytes);
+    return 0;
+}
+
+static RGA_TextureData *RGA_FindTexture(SW_RenderData *data, SDL_Texture *texture)
+{
+    RGA_TextureData *item = data->rga_textures;
+    while (item != NULL && item->texture != texture) {
+        item = item->next;
+    }
+    return item;
+}
+
+static void RGA_DropScale(SW_RenderData *data, RGA_TextureData *item)
+{
+    if (item->scaled != NULL) {
+        data->scale_cache_bytes -= (size_t)item->scaled->pitch * item->scaled->h;
+        SDL_FreeSurface(item->scaled);
+        item->scaled = NULL;
+    }
+    item->scale_seen = SDL_FALSE;
+}
+
+static void RGA_ReleaseTexture(SW_RenderData *data, RGA_TextureData *item)
+{
+    RGA_DropScale(data, item);
+    if (item->handle) releasebuffer_handle(item->handle);
+    munmap(item->pixels, item->bytes);
+    close(item->fd);
+    SDL_free(item);
+}
+
+static void RGA_UpdateTexture(RGA_TextureData *item)
+{
+    SDL_Surface *surface = (SDL_Surface *)item->texture->driverdata;
+    const int width = surface->w;
+    int row;
+
+    for (row = 0; row < surface->h; ++row) {
+        const Uint8 *src = (const Uint8 *)surface->pixels + row * surface->pitch;
+        Uint8 *dst = (Uint8 *)item->pixels + row * item->pitch;
+        if (item->format == RK_FORMAT_RGB_565) {
+            SDL_memcpy(dst, src, (size_t)width * 2u);
+        } else {
+            const Uint32 *in = (const Uint32 *)src;
+            Uint32 *out = (Uint32 *)dst;
+            int col;
+            /* RGA SRC_OVER expects premultiplied RGBA; the SDL surface
+             * remains straight-alpha for software blend operations. */
+            for (col = 0; col < width; ++col) {
+                const Uint32 pixel = in[col];
+                const Uint32 alpha = pixel >> 24;
+                const Uint32 red = (((pixel >> 16) & 255u) * alpha + 127u) / 255u;
+                const Uint32 green = (((pixel >> 8) & 255u) * alpha + 127u) / 255u;
+                const Uint32 blue = ((pixel & 255u) * alpha + 127u) / 255u;
+                out[col] = (alpha << 24) | (red << 16) | (green << 8) | blue;
+            }
+        }
+    }
+    item->dirty = SDL_FALSE;
+}
+
+/* Return 1 for hardware, 2 for cached pixels, 0 for SDL software fallback,
+ * and -1 for errors. Ownership must be acquired before any CPU pixel access. */
+static int RGA_Copy(SW_RenderData *data, SDL_Texture *texture,
+                    const SDL_Rect *sr, const SDL_Rect *dr, SDL_ScaleMode scale_mode,
+                    const SDL_Rect *clip, Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha,
+                    SDL_BlendMode blend, int transform)
+{
+    RGA_TextureData *item = RGA_FindTexture(data, texture);
+    rga_buffer_t source, target, pat;
+    im_rect src_rect, dst_rect, empty;
+    IM_STATUS status;
+    int usage;
+    SDL_bool cacheable, capture = SDL_FALSE;
+
+    if (item != NULL && item->dirty) RGA_DropScale(data, item);
+
+    if (item == NULL || sr->w < 2 || sr->h < 2 || dr->w < 16 || dr->h < 16 ||
+        sr->x < 0 || sr->y < 0 || sr->w > texture->w - sr->x ||
+        sr->h > texture->h - sr->y ||
+        dr->x < clip->x || dr->y < clip->y ||
+        dr->w > clip->w - (dr->x - clip->x) ||
+        dr->h > clip->h - (dr->y - clip->y) ||
+        dr->x < 0 || dr->y < 0 ||
+        dr->w > data->window->w - dr->x || dr->h > data->window->h - dr->y ||
+        red != 255 || green != 255 || blue != 255 || alpha != 255 ||
+        ((sr->w != dr->w || sr->h != dr->h) && scale_mode != SDL_ScaleModeLinear) ||
+        (transform != 0 && (sr->w != dr->w || sr->h != dr->h)) ||
+        dr->w > sr->w * 16 || dr->h > sr->h * 16 ||
+        sr->w > dr->w * 16 || sr->h > dr->h * 16) {
+        return 0;
+    }
+    if (!data->rga_force) {
+        const int area = dr->w * dr->h;
+        const SDL_bool scaled = sr->w != dr->w || sr->h != dr->h;
+        if ((transform != 0 && area < 16384) ||
+            (scaled && area < 4096) ||
+            (!scaled && transform == 0 && item->format == RK_FORMAT_RGB_565 && area < 120000) ||
+            (!scaled && transform == 0 && item->format != RK_FORMAT_RGB_565 && area < 16384)) {
+            return 0;
+        }
+    }
+    if (item->format == RK_FORMAT_RGB_565) {
+        if (blend != SDL_BLENDMODE_NONE) {
+            return 0;
+        }
+        usage = 0;
+    } else {
+        if (blend != SDL_BLENDMODE_BLEND) {
+            return 0;
+        }
+        usage = IM_ALPHA_BLEND_SRC_OVER;
+    }
+    /* Cache only background-independent, opaque linear scaling. Keep one
+     * variant per texture, at most 512 KiB per renderer, and promote only
+     * after a second identical request. Animated/updated textures cannot hit.
+     * FORCE bypasses the cache so diagnostics still exercise the hardware. */
+    cacheable = data->rga_cache && !data->rga_force && item->format == RK_FORMAT_RGB_565 &&
+                transform == 0 && (sr->w != dr->w || sr->h != dr->h);
+    if (cacheable) {
+        if (item->scale_seen && SDL_RectEquals(&item->scale_source, sr) &&
+            item->scale_width == dr->w && item->scale_height == dr->h) {
+            if (item->scaled != NULL) {
+                SDL_Rect dest = *dr;
+                if (RGA_CPU(data) < 0) return -1;
+                if (SDL_BlitSurface(item->scaled, NULL, data->window, &dest) < 0) return -1;
+                data->rga_cache_count++;
+                return 2;
+            }
+            capture = SDL_TRUE;
+        } else {
+            RGA_DropScale(data, item);
+            item->scale_source = *sr;
+            item->scale_width = dr->w;
+            item->scale_height = dr->h;
+            item->scale_seen = SDL_TRUE;
+        }
+    }
+    if (item->dirty) {
+        if (RGA_Access(item->fd, &item->cpu_access, SDL_TRUE) < 0) return -1;
+        RGA_UpdateTexture(item);
+    }
+    if (RGA_Access(item->fd, &item->cpu_access, SDL_FALSE) < 0 ||
+        RGA_Access(data->rga_fd, &data->rga_cpu_access, SDL_FALSE) < 0) return -1;
+    source = RGA_Buffer(item->handle, item->fd, texture->w, texture->h,
+                             item->pitch / (item->format == RK_FORMAT_RGB_565 ? 2 : 4),
+                             item->format);
+    target = RGA_Buffer(data->rga_handle, data->rga_fd, data->window->w, data->window->h,
+                         data->window->pitch / 2, RK_FORMAT_RGB_565);
+    SDL_zero(pat);
+    src_rect.x = sr->x;
+    src_rect.y = sr->y;
+    src_rect.width = sr->w;
+    src_rect.height = sr->h;
+    dst_rect.x = dr->x;
+    dst_rect.y = dr->y;
+    dst_rect.width = dr->w;
+    dst_rect.height = dr->h;
+    SDL_zero(empty);
+    status = improcess(source, target, pat, src_rect, dst_rect, empty, usage | transform);
+    if (status != IM_STATUS_SUCCESS) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_RENDER, "RGA blit failed (%d): %s; using CPU",
+                    (int)status, imStrError_t(status));
+        return 0;
+    }
+    if (capture && data->scale_cache_bytes + (size_t)((dr->w * 2 + 3) & ~3) * dr->h <= 512u * 1024u) {
+        SDL_Surface *cached = SDL_CreateRGBSurfaceWithFormat(0, dr->w, dr->h, 16, SDL_PIXELFORMAT_RGB565);
+        if (cached != NULL) {
+            int row;
+            if (RGA_CPU(data) < 0) {
+                SDL_FreeSurface(cached);
+                return -1;
+            }
+            for (row = 0; row < dr->h; ++row) {
+                SDL_memcpy((Uint8 *)cached->pixels + row * cached->pitch,
+                           (Uint8 *)data->window->pixels + (dr->y + row) * data->window->pitch + dr->x * 2,
+                           (size_t)dr->w * 2u);
+            }
+            item->scaled = cached;
+            data->scale_cache_bytes += (size_t)cached->pitch * cached->h;
+        }
+    }
+    return 1;
+}
+
+static int RGA_AlphaFill(SW_RenderData *data, const SDL_Rect *rect,
+                         Uint8 red, Uint8 green, Uint8 blue, Uint8 alpha)
+{
+    rga_buffer_t source, target, pat;
+    im_rect src_rect = { 0, 0, 32, 32 };
+    im_rect dst_rect, empty;
+    IM_STATUS status;
+    Uint32 color;
+
+    if (data->fill_fd < 0 || rect->w < 16 || rect->h < 16 ||
+        rect->w > 512 || rect->h > 512 || alpha == 0) {
+        return 0;
+    }
+    if (!data->rga_force && rect->w * rect->h < 8192) {
+        return 0;
+    }
+    color = ((Uint32)alpha << 24) |
+            ((((Uint32)red * alpha + 127u) / 255u) << 16) |
+            ((((Uint32)green * alpha + 127u) / 255u) << 8) |
+            (((Uint32)blue * alpha + 127u) / 255u);
+    if (!data->fill_valid || data->fill_color != color) {
+        Uint32 *pixels = (Uint32 *)data->fill_pixels;
+        size_t i;
+        if (RGA_Access(data->fill_fd, &data->fill_cpu_access, SDL_TRUE) < 0) return -1;
+        for (i = 0; i < 32u * 32u; ++i) {
+            pixels[i] = color;
+        }
+        data->fill_color = color;
+        data->fill_valid = SDL_TRUE;
+    }
+    if (RGA_Access(data->fill_fd, &data->fill_cpu_access, SDL_FALSE) < 0 ||
+        RGA_Access(data->rga_fd, &data->rga_cpu_access, SDL_FALSE) < 0) return -1;
+    source = RGA_Buffer(data->fill_handle, data->fill_fd, 32, 32, 32, RK_FORMAT_RGBA_8888);
+    target = RGA_Buffer(data->rga_handle, data->rga_fd, data->window->w, data->window->h,
+                         data->window->pitch / 2, RK_FORMAT_RGB_565);
+    SDL_zero(pat);
+    SDL_zero(empty);
+    dst_rect.x = rect->x;
+    dst_rect.y = rect->y;
+    dst_rect.width = rect->w;
+    dst_rect.height = rect->h;
+    status = improcess(source, target, pat, src_rect, dst_rect, empty, IM_ALPHA_BLEND_SRC_OVER);
+    if (status != IM_STATUS_SUCCESS) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_RENDER, "RGA alpha fill failed (%d): %s; using CPU",
+                    (int)status, imStrError_t(status));
+        return 0;
+    }
+    return 1;
+}
+
+/* Return 1 on hardware success, 0 if CPU should draw, -1 if the CPU mapping
+ * could not be re-acquired and must not be accessed. */
+static int RGA_Fill(SW_RenderData *data, const SDL_Rect *rect, Uint8 r, Uint8 g, Uint8 b)
+{
+    rga_buffer_t target;
+    im_rect area;
+    IM_STATUS result;
+    int color;
+
+    if (data->rga_fd < 0 || rect->w < 16 || rect->h < 16 ||
+        (!data->rga_force && rect->w * rect->h < 250000)) {
+        return 0;
+    }
+    if (RGA_Access(data->rga_fd, &data->rga_cpu_access, SDL_FALSE) < 0) return -1;
+    target = RGA_Buffer(data->rga_handle, data->rga_fd, data->window->w, data->window->h,
+                         data->window->pitch / 2, RK_FORMAT_RGB_565);
+    area.x = rect->x;
+    area.y = rect->y;
+    area.width = rect->w;
+    area.height = rect->h;
+    color = (int)(0xff000000u | ((Uint32)r << 16) | ((Uint32)g << 8) | (Uint32)b);
+    result = imfill_t(target, area, color, 1);
+    if (result != IM_STATUS_SUCCESS) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_RENDER, "RGA fill failed (%d): %s; using CPU",
+                    (int)result, imStrError_t(result));
+        return 0;
+    }
+    return 1;
+}
+#endif
 
 static SDL_Surface *SW_ActivateRenderer(SDL_Renderer *renderer)
 {
@@ -66,11 +474,60 @@ static SDL_Surface *SW_ActivateRenderer(SDL_Renderer *renderer)
     return data->surface;
 }
 
+static int SW_CPUAccess(SDL_Renderer *renderer)
+{
+#if SDL_VIDEO_RENDER_RGA
+    SW_RenderData *data = (SW_RenderData *)renderer->driverdata;
+    if (data->surface == data->window) return RGA_CPU(data);
+#endif
+    return 0;
+}
+
 static void SW_WindowEvent(SDL_Renderer *renderer, const SDL_WindowEvent *event)
 {
     SW_RenderData *data = (SW_RenderData *)renderer->driverdata;
 
     if (event->event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+#if SDL_VIDEO_RENDER_RGA
+        if (data->rga_fd >= 0) {
+            int width, height, pitch, fd = -1;
+            size_t bytes;
+            void *pixels;
+            SDL_Surface *replacement;
+            SDL_Surface *previous;
+            SDL_GetWindowSizeInPixels(renderer->window, &width, &height);
+            if (width == data->window->w && height == data->window->h) {
+                return;
+            }
+            if (RGA_Allocate(width, height, 2, &fd, &pixels, &pitch, &bytes) < 0) {
+                SDL_LogError(SDL_LOG_CATEGORY_RENDER, "RGA: cannot resize DMA surface to %dx%d", width, height);
+                return;
+            }
+            replacement = SDL_CreateRGBSurfaceFrom(pixels, width, height, 16, pitch,
+                                                    0xf800u, 0x07e0u, 0x001fu, 0);
+            if (replacement == NULL) {
+                munmap(pixels, bytes);
+                close(fd);
+                return;
+            }
+            previous = data->window;
+            if (data->surface == previous) {
+                data->surface = replacement;
+            }
+            data->window = replacement;
+            SDL_FreeSurface(previous);
+            if (data->rga_handle) releasebuffer_handle(data->rga_handle);
+            munmap(data->rga_pixels, data->rga_bytes);
+            close(data->rga_fd);
+            data->rga_fd = fd;
+            data->rga_pixels = pixels;
+            data->rga_bytes = bytes;
+            data->rga_cpu_access = SDL_TRUE;
+            data->rga_handle = RGA_Import(pitch, height, RK_FORMAT_RGB_565, fd);
+            if (data->rga_handle) data->rga_import_count++;
+            return;
+        }
+#endif
         data->surface = NULL;
         data->window = NULL;
     }
@@ -102,6 +559,9 @@ static int SW_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture)
 {
     int bpp;
     Uint32 Rmask, Gmask, Bmask, Amask;
+#if SDL_VIDEO_RENDER_RGA
+    SW_RenderData *render_data = (SW_RenderData *)renderer->driverdata;
+#endif
 
     if (!SDL_PixelFormatEnumToMasks(texture->format, &bpp, &Rmask, &Gmask, &Bmask, &Amask)) {
         return SDL_SetError("Unknown texture format");
@@ -110,6 +570,9 @@ static int SW_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture)
     texture->driverdata =
         SDL_CreateRGBSurface(0, texture->w, texture->h, bpp, Rmask, Gmask,
                              Bmask, Amask);
+    if (!texture->driverdata) {
+        return -1;
+    }
     SDL_SetSurfaceColorMod(texture->driverdata, texture->color.r, texture->color.g, texture->color.b);
     SDL_SetSurfaceAlphaMod(texture->driverdata, texture->color.a);
     SDL_SetSurfaceBlendMode(texture->driverdata, texture->blendMode);
@@ -117,13 +580,40 @@ static int SW_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture)
     /* Only RLE encode textures without an alpha channel since the RLE coder
      * discards the color values of pixels with an alpha value of zero.
      */
-    if (texture->access == SDL_TEXTUREACCESS_STATIC && !Amask) {
+    if (texture->access == SDL_TEXTUREACCESS_STATIC && !Amask
+#if SDL_VIDEO_RENDER_RGA
+        && render_data->rga_fd < 0
+#endif
+       ) {
         SDL_SetSurfaceRLE(texture->driverdata, 1);
     }
 
-    if (!texture->driverdata) {
-        return -1;
+#if SDL_VIDEO_RENDER_RGA
+    if (render_data->rga_fd >= 0 &&
+        (texture->format == SDL_PIXELFORMAT_RGB565 ||
+         texture->format == SDL_PIXELFORMAT_ARGB8888)) {
+        RGA_TextureData *item = (RGA_TextureData *)SDL_calloc(1, sizeof(*item));
+        if (item != NULL) {
+            int pitch;
+            const int bytes_per_pixel = texture->format == SDL_PIXELFORMAT_RGB565 ? 2 : 4;
+            item->fd = -1;
+            if (RGA_Allocate(texture->w, texture->h, bytes_per_pixel,
+                             &item->fd, &item->pixels, &pitch, &item->bytes) == 0) {
+                item->texture = texture;
+                item->pitch = pitch;
+                item->format = bytes_per_pixel == 2 ? RK_FORMAT_RGB_565 : RK_FORMAT_RGBA_8888;
+                item->dirty = SDL_TRUE;
+                item->cpu_access = SDL_TRUE;
+                item->handle = RGA_Import(pitch, texture->h, item->format, item->fd);
+                if (item->handle) render_data->rga_import_count++;
+                item->next = render_data->rga_textures;
+                render_data->rga_textures = item;
+            } else {
+                SDL_free(item); /* Resource exhaustion: texture still works through SDL. */
+            }
+        }
     }
+#endif
     return 0;
 }
 
@@ -151,6 +641,17 @@ static int SW_UpdateTexture(SDL_Renderer *renderer, SDL_Texture *texture,
     if (SDL_MUSTLOCK(surface)) {
         SDL_UnlockSurface(surface);
     }
+#if SDL_VIDEO_RENDER_RGA
+    {
+        SW_RenderData *data = (SW_RenderData *)renderer->driverdata;
+        if (data->rga_fd >= 0) {
+            RGA_TextureData *item = RGA_FindTexture(data, texture);
+            if (item != NULL) {
+                item->dirty = SDL_TRUE;
+            }
+        }
+    }
+#endif
     return 0;
 }
 
@@ -168,6 +669,15 @@ static int SW_LockTexture(SDL_Renderer *renderer, SDL_Texture *texture,
 
 static void SW_UnlockTexture(SDL_Renderer *renderer, SDL_Texture *texture)
 {
+#if SDL_VIDEO_RENDER_RGA
+    SW_RenderData *data = (SW_RenderData *)renderer->driverdata;
+    if (data->rga_fd >= 0) {
+        RGA_TextureData *item = RGA_FindTexture(data, texture);
+        if (item != NULL) {
+            item->dirty = SDL_TRUE;
+        }
+    }
+#endif
 }
 
 static void SW_SetTextureScaleMode(SDL_Renderer *renderer, SDL_Texture *texture, SDL_ScaleMode scaleMode)
@@ -662,6 +1172,15 @@ static int SW_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, vo
 {
     SDL_Surface *surface = SW_ActivateRenderer(renderer);
     SW_DrawStateCache drawstate;
+#if SDL_VIDEO_RENDER_RGA
+    SW_RenderData *rga_data = (SW_RenderData *)renderer->driverdata;
+    if (rga_data->rga_fd >= 0 && renderer->target != NULL) {
+        RGA_TextureData *target_item = RGA_FindTexture(rga_data, renderer->target);
+        if (target_item != NULL) {
+            target_item->dirty = SDL_TRUE;
+        }
+    }
+#endif
 
     if (surface == NULL) {
         return -1;
@@ -696,6 +1215,21 @@ static int SW_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, vo
                 const Uint8 a = cmd->data.color.a;
                 /* By definition the clear ignores the clip rect */
                 SDL_SetClipRect(surface, NULL);
+#if SDL_VIDEO_RENDER_RGA
+                if (rga_data->rga_fd >= 0 && surface == rga_data->window) {
+                    SDL_Rect full = { 0, 0, surface->w, surface->h };
+                    const int accelerated = RGA_Fill(rga_data, &full, r, g, b);
+                    if (accelerated < 0) {
+                        return -1;
+                    }
+                    if (accelerated > 0) {
+                        rga_data->rga_fill_count++;
+                        drawstate.surface_cliprect_dirty = SDL_TRUE;
+                        break;
+                    }
+                }
+#endif
+                if (SW_CPUAccess(renderer) < 0) return -1;
                 SDL_FillRect(surface, NULL, SDL_MapRGBA(surface->format, r, g, b, a));
                 drawstate.surface_cliprect_dirty = SDL_TRUE;
                 break;
@@ -710,6 +1244,7 @@ static int SW_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, vo
                 SDL_Point *verts = (SDL_Point *) (((Uint8 *) vertices) + cmd->data.draw.first);
                 const SDL_BlendMode blend = cmd->data.draw.blend;
                 SetDrawState(surface, &drawstate);
+                if (SW_CPUAccess(renderer) < 0) return -1;
 
                 /* Apply viewport */
                 if (drawstate.viewport != NULL && (drawstate.viewport->x || drawstate.viewport->y)) {
@@ -737,6 +1272,7 @@ static int SW_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, vo
                 SDL_Point *verts = (SDL_Point *) (((Uint8 *) vertices) + cmd->data.draw.first);
                 const SDL_BlendMode blend = cmd->data.draw.blend;
                 SetDrawState(surface, &drawstate);
+                if (SW_CPUAccess(renderer) < 0) return -1;
 
                 /* Apply viewport */
                 if (drawstate.viewport != NULL && (drawstate.viewport->x || drawstate.viewport->y)) {
@@ -774,6 +1310,43 @@ static int SW_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, vo
                     }
                 }
 
+#if SDL_VIDEO_RENDER_RGA
+                if (rga_data->rga_fd >= 0 && surface == rga_data->window &&
+                    (blend == SDL_BLENDMODE_NONE || blend == SDL_BLENDMODE_BLEND)) {
+                    int i;
+                    for (i = 0; i < count; ++i) {
+                        SDL_Rect clip, clipped;
+                        SDL_GetClipRect(surface, &clip);
+                        if (!SDL_IntersectRect(&verts[i], &clip, &clipped)) {
+                            continue;
+                        }
+                        {
+                            const int accelerated = (blend == SDL_BLENDMODE_BLEND && a < 255) ?
+                                RGA_AlphaFill(rga_data, &clipped, r, g, b, a) :
+                                RGA_Fill(rga_data, &clipped, r, g, b);
+                            if (accelerated < 0) {
+                                return -1;
+                            }
+                            if (accelerated > 0) {
+                                if (blend == SDL_BLENDMODE_BLEND && a < 255) {
+                                    rga_data->rga_alpha_count++;
+                                } else {
+                                    rga_data->rga_fill_count++;
+                                }
+                                continue;
+                            }
+                        }
+                        if (SW_CPUAccess(renderer) < 0) return -1;
+                        if (blend == SDL_BLENDMODE_NONE) {
+                            SDL_FillRect(surface, &verts[i], SDL_MapRGBA(surface->format, r, g, b, a));
+                        } else {
+                            SDL_BlendFillRects(surface, &verts[i], 1, blend, r, g, b, a);
+                        }
+                    }
+                    break;
+                }
+#endif
+                if (SW_CPUAccess(renderer) < 0) return -1;
                 if (blend == SDL_BLENDMODE_NONE) {
                     SDL_FillRects(surface, verts, count, SDL_MapRGBA(surface->format, r, g, b, a));
                 } else {
@@ -791,6 +1364,30 @@ static int SW_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, vo
 
                 SetDrawState(surface, &drawstate);
 
+#if SDL_VIDEO_RENDER_RGA
+                if (rga_data->rga_fd >= 0 && surface == rga_data->window) {
+                    SDL_Rect output_clip;
+                    SDL_Rect candidate = *dstrect;
+                    int accelerated;
+                    if (drawstate.viewport != NULL) {
+                        candidate.x += drawstate.viewport->x;
+                        candidate.y += drawstate.viewport->y;
+                    }
+                    SDL_GetClipRect(surface, &output_clip);
+                    accelerated = RGA_Copy(rga_data, texture, srcrect, &candidate,
+                                           texture->scaleMode, &output_clip,
+                                           cmd->data.draw.r, cmd->data.draw.g,
+                                           cmd->data.draw.b, cmd->data.draw.a, cmd->data.draw.blend, 0);
+                    if (accelerated < 0) {
+                        return -1;
+                    }
+                    if (accelerated > 0) {
+                        if (accelerated == 1) rga_data->rga_copy_count++;
+                        break;
+                    }
+                }
+#endif
+                if (SW_CPUAccess(renderer) < 0) return -1;
                 PrepTextureForCopy(cmd);
 
                 /* Apply viewport */
@@ -849,6 +1446,55 @@ static int SW_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, vo
             case SDL_RENDERCMD_COPY_EX: {
                 CopyExData *copydata = (CopyExData *) (((Uint8 *) vertices) + cmd->data.draw.first);
                 SetDrawState(surface, &drawstate);
+#if SDL_VIDEO_RENDER_RGA
+                if (rga_data->rga_fd >= 0 && surface == rga_data->window &&
+                    copydata->scale_x == 1.0f && copydata->scale_y == 1.0f &&
+                    copydata->srcrect.w == copydata->dstrect.w &&
+                    copydata->srcrect.h == copydata->dstrect.h &&
+                    copydata->center.x == (float)copydata->dstrect.w / 2.0f &&
+                    copydata->center.y == (float)copydata->dstrect.h / 2.0f) {
+                    int transform = -1;
+                    SDL_Rect output_clip, candidate = copydata->dstrect;
+                    if (copydata->angle == 0.0) transform = 0;
+                    if (copydata->angle == 90.0 && candidate.w == candidate.h) transform = IM_HAL_TRANSFORM_ROT_90;
+                    if (copydata->angle == 180.0) transform = IM_HAL_TRANSFORM_ROT_180;
+                    if (copydata->angle == 270.0 && candidate.w == candidate.h) transform = IM_HAL_TRANSFORM_ROT_270;
+                    if (copydata->flip != SDL_FLIP_NONE) {
+                        transform = -1;
+                        if (copydata->angle == 0.0) {
+                            switch ((int)copydata->flip) {
+                            case SDL_FLIP_HORIZONTAL: transform = IM_HAL_TRANSFORM_FLIP_H; break;
+                            case SDL_FLIP_VERTICAL: transform = IM_HAL_TRANSFORM_FLIP_V; break;
+                            case (SDL_FLIP_HORIZONTAL | SDL_FLIP_VERTICAL):
+                                transform = IM_HAL_TRANSFORM_FLIP_H_V;
+                                break;
+                            default: break;
+                            }
+                        }
+                    }
+                    if (transform >= 0) {
+                        int accelerated;
+                        if (drawstate.viewport != NULL) {
+                            candidate.x += drawstate.viewport->x;
+                            candidate.y += drawstate.viewport->y;
+                        }
+                        SDL_GetClipRect(surface, &output_clip);
+                        accelerated = RGA_Copy(rga_data, cmd->data.draw.texture,
+                                               &copydata->srcrect, &candidate,
+                                               cmd->data.draw.texture->scaleMode,
+                                               &output_clip, cmd->data.draw.r,
+                                               cmd->data.draw.g, cmd->data.draw.b,
+                                               cmd->data.draw.a, cmd->data.draw.blend, transform);
+                        if (accelerated < 0) return -1;
+                        if (accelerated > 0) {
+                            if (transform == 0 && accelerated == 1) rga_data->rga_copy_count++;
+                            else if (transform != 0) rga_data->rga_rotate_count++;
+                            break;
+                        }
+                    }
+                }
+#endif
+                if (SW_CPUAccess(renderer) < 0) return -1;
                 PrepTextureForCopy(cmd);
 
                 /* Apply viewport */
@@ -871,6 +1517,7 @@ static int SW_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, vo
                 const SDL_BlendMode blend = cmd->data.draw.blend;
 
                 SetDrawState(surface, &drawstate);
+                if (SW_CPUAccess(renderer) < 0) return -1;
 
                 if (texture) {
                     SDL_Surface *src = (SDL_Surface *) texture->driverdata;
@@ -941,6 +1588,7 @@ static int SW_RenderReadPixels(SDL_Renderer *renderer, const SDL_Rect *rect,
     if (surface == NULL) {
         return -1;
     }
+    if (SW_CPUAccess(renderer) < 0) return -1;
 
     /* NOTE: The rect is already adjusted according to the viewport by
      * SDL_RenderReadPixels.
@@ -968,6 +1616,55 @@ static int SW_RenderPresent(SDL_Renderer *renderer)
     if (window == NULL) {
         return -1;
     }
+#if SDL_VIDEO_RENDER_RGA
+    {
+        SW_RenderData *data = (SW_RenderData *)renderer->driverdata;
+        if (data->rga_fd >= 0) {
+            SDL_Surface *output;
+            if (RGA_CPU(data) < 0) return -1;
+#if SDL_VIDEO_DRIVER_DIRECTFB
+            if (SDL_strcmp(SDL_GetCurrentVideoDriver(), "directfb") == 0) {
+                DFB_WindowData *windata = (DFB_WindowData *)window->driverdata;
+                DFBSurfacePixelFormat format;
+                void *destination;
+                int pitch, row, width, height;
+                if (windata == NULL || windata->surface == NULL || windata->window_surface == NULL ||
+                    windata->surface->GetPixelFormat(windata->surface, &format) != DFB_OK ||
+                    format != DSPF_RGB16 ||
+                    windata->surface->GetSize(windata->surface, &width, &height) != DFB_OK ||
+                    width != data->window->w || height != data->window->h) {
+                    return SDL_SetError("RGA: DirectFB RGB565 drawing surface unavailable");
+                }
+                if (windata->surface->Lock(windata->surface, DSLF_WRITE, &destination, &pitch) != DFB_OK) {
+                    return SDL_SetError("RGA: DirectFB lock failed");
+                }
+                if (pitch < data->window->w * 2) {
+                    windata->surface->Unlock(windata->surface);
+                    return SDL_SetError("RGA: DirectFB pitch is too small");
+                }
+                for (row = 0; row < height; ++row) {
+                    SDL_memcpy((Uint8 *)destination + row * pitch,
+                               (const Uint8 *)data->window->pixels + row * data->window->pitch,
+                               (size_t)width * 2u);
+                }
+                if (windata->surface->Unlock(windata->surface) != DFB_OK ||
+                    windata->window_surface->Flip(windata->window_surface, NULL,
+                                                  DSFLIP_BLIT | DSFLIP_ONSYNC) != DFB_OK) {
+                    return SDL_SetError("RGA: DirectFB present failed");
+                }
+                return 0;
+            }
+#endif
+            output = SDL_GetWindowSurface(window);
+            if (output == NULL || output->w != data->window->w || output->h != data->window->h) {
+                return SDL_SetError("RGA: window surface unavailable or resized");
+            }
+            if (SDL_BlitSurface(data->window, NULL, output, NULL) != 0) {
+                return -1;
+            }
+        }
+    }
+#endif
     return SDL_UpdateWindowSurface(window);
 }
 
@@ -975,6 +1672,21 @@ static void SW_DestroyTexture(SDL_Renderer *renderer, SDL_Texture *texture)
 {
     SDL_Surface *surface = (SDL_Surface *)texture->driverdata;
 
+#if SDL_VIDEO_RENDER_RGA
+    SW_RenderData *data = (SW_RenderData *)renderer->driverdata;
+    if (data->rga_fd >= 0) {
+        RGA_TextureData **link = &data->rga_textures;
+        while (*link != NULL) {
+            if ((*link)->texture == texture) {
+                RGA_TextureData *item = *link;
+                *link = item->next;
+                RGA_ReleaseTexture(data, item);
+                break;
+            }
+            link = &(*link)->next;
+        }
+    }
+#endif
     SDL_FreeSurface(surface);
 }
 
@@ -982,6 +1694,34 @@ static void SW_DestroyRenderer(SDL_Renderer *renderer)
 {
     SW_RenderData *data = (SW_RenderData *)renderer->driverdata;
 
+#if SDL_VIDEO_RENDER_RGA
+    if (data != NULL && data->rga_fd >= 0) {
+        RGA_TextureData *item = data->rga_textures;
+        if (SDL_GetHintBoolean("SDL_RGA_STATS", SDL_FALSE)) {
+            SDL_Log("RGA: fill=%llu alpha=%llu copy=%llu rotate=%llu cache=%llu imports=%llu",
+                    (unsigned long long)data->rga_fill_count,
+                    (unsigned long long)data->rga_alpha_count,
+                    (unsigned long long)data->rga_copy_count,
+                    (unsigned long long)data->rga_rotate_count,
+                    (unsigned long long)data->rga_cache_count,
+                    (unsigned long long)data->rga_import_count);
+        }
+        while (item != NULL) {
+            RGA_TextureData *next = item->next;
+            RGA_ReleaseTexture(data, item);
+            item = next;
+        }
+        SDL_FreeSurface(data->window);
+        if (data->rga_handle) releasebuffer_handle(data->rga_handle);
+        munmap(data->rga_pixels, data->rga_bytes);
+        close(data->rga_fd);
+        if (data->fill_fd >= 0) {
+            if (data->fill_handle) releasebuffer_handle(data->fill_handle);
+            munmap(data->fill_pixels, data->fill_bytes);
+            close(data->fill_fd);
+        }
+    }
+#endif
     SDL_free(data);
     SDL_free(renderer);
 }
@@ -1010,6 +1750,10 @@ SDL_Renderer *SW_CreateRendererForSurface(SDL_Surface *surface)
     }
     data->surface = surface;
     data->window = surface;
+#if SDL_VIDEO_RENDER_RGA
+    data->rga_fd = -1;
+    data->fill_fd = -1;
+#endif
 
     renderer->WindowEvent = SW_WindowEvent;
     renderer->GetOutputSize = SW_GetOutputSize;
@@ -1090,6 +1834,91 @@ SDL_RenderDriver SW_RenderDriver = {
      0,
      0}
 };
+
+#if SDL_VIDEO_RENDER_RGA
+static SDL_Renderer *RGA_CreateRenderer(SDL_Window *window, Uint32 flags)
+{
+    SDL_Renderer *renderer;
+    SW_RenderData *data;
+    SDL_Surface *surface;
+    void *pixels;
+    int width, height, pitch, fd = -1;
+    size_t bytes;
+
+    (void)flags;
+    SDL_GetWindowSizeInPixels(window, &width, &height);
+    if (width < 2 || height < 2 || width > 1280 || height > 1280) {
+        SDL_SetError("RGA supports window sizes from 2x2 through 1280x1280");
+        return NULL;
+    }
+#if SDL_VIDEO_DRIVER_DIRECTFB
+    if (SDL_strcmp(SDL_GetCurrentVideoDriver(), "directfb") == 0) {
+        DFB_WindowData *windata = (DFB_WindowData *)window->driverdata;
+        if (windata == NULL || windata->surface == NULL || windata->window_surface == NULL) {
+            SDL_SetError("RGA: DirectFB drawing surface unavailable");
+            return NULL;
+        }
+    } else
+#endif
+    if (SDL_GetWindowSurface(window) == NULL) {
+        return NULL;
+    }
+    if (RGA_Allocate(width, height, 2, &fd, &pixels, &pitch, &bytes) < 0) {
+        SDL_SetError("RGA: cannot allocate DMA buffer");
+        return NULL;
+    }
+    surface = SDL_CreateRGBSurfaceFrom(pixels, width, height, 16, pitch,
+                                         0xf800u, 0x07e0u, 0x001fu, 0);
+    if (surface == NULL) {
+        munmap(pixels, bytes);
+        close(fd);
+        return NULL;
+    }
+    renderer = SW_CreateRendererForSurface(surface);
+    if (renderer == NULL) {
+        SDL_FreeSurface(surface);
+        munmap(pixels, bytes);
+        close(fd);
+        return NULL;
+    }
+    data = (SW_RenderData *)renderer->driverdata;
+    data->rga_fd = fd;
+    data->rga_bytes = bytes;
+    data->rga_pixels = pixels;
+    data->rga_cpu_access = SDL_TRUE;
+    data->rga_handle = RGA_Import(pitch, height, RK_FORMAT_RGB_565, fd);
+    if (data->rga_handle) data->rga_import_count++;
+    data->rga_force = SDL_GetHintBoolean("SDL_RGA_FORCE", SDL_FALSE);
+    data->rga_cache = SDL_GetHintBoolean("SDL_RGA_CACHE", SDL_TRUE);
+    data->fill_fd = -1;
+    renderer->info = RGA_RenderDriver.info;
+    renderer->window = window;
+    {
+        int fill_pitch;
+        if (RGA_Allocate(32, 32, 4, &data->fill_fd, &data->fill_pixels,
+                         &fill_pitch, &data->fill_bytes) != 0) {
+            data->fill_fd = -1; /* Alpha fills remain available via software. */
+        } else {
+            data->fill_cpu_access = SDL_TRUE;
+            data->fill_handle = RGA_Import(fill_pitch, 32, RK_FORMAT_RGBA_8888, data->fill_fd);
+            if (data->fill_handle) data->rga_import_count++;
+        }
+    }
+    return renderer;
+}
+
+SDL_RenderDriver RGA_RenderDriver = {
+    RGA_CreateRenderer,
+    {
+        "rga",
+        SDL_RENDERER_ACCELERATED | SDL_RENDERER_TARGETTEXTURE,
+        2,
+        { SDL_PIXELFORMAT_RGB565, SDL_PIXELFORMAT_ARGB8888 },
+        1280,
+        1280
+    }
+};
+#endif
 
 #endif /* SDL_VIDEO_RENDER_SW && !SDL_RENDER_DISABLED */
 

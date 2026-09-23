@@ -167,22 +167,38 @@ static void bounding_rect(const SDL_Point *a, const SDL_Point *b, const SDL_Poin
                     Uint8 *dptr = (Uint8 *)dst_ptr + x * dstbpp;
 
 /* Use 64 bits precision to prevent overflow when interpolating color / texture with wide triangles */
+/* A constant denominator is shared by every pixel in a triangle. ARMv7 has
+ * no 64-bit divide instruction: doing this six times per pixel dominated the
+ * Nuklear UI. For nonnegative 32-bit numerators, reciprocal multiplication
+ * underestimates the quotient by at most one. The correction makes this
+ * EXACT integer division, including texel boundaries and colour rounding.
+ * Unusual large or negative numerators retain the original signed division. */
+static SDL_INLINE int triangle_divide(Sint64 numerator, int area, Uint32 reciprocal)
+{
+    if (reciprocal != 0 && (Uint64)numerator <= SDL_MAX_UINT32) {
+        const Uint32 n = (Uint32)numerator;
+        const Uint32 q = (Uint32)(((Uint64)n * reciprocal) >> 32);
+        return (int)(q + (n - q * (Uint32)area >= (Uint32)area));
+    }
+    return (int)(numerator / area);
+}
+
 #define TRIANGLE_GET_TEXTCOORD                                                          \
-    int srcx = (int)(((Sint64)w0 * s2s0_x + (Sint64)w1 * s2s1_x + s2_x_area.x) / area); \
-    int srcy = (int)(((Sint64)w0 * s2s0_y + (Sint64)w1 * s2s1_y + s2_x_area.y) / area);
+    int srcx = triangle_divide((Sint64)w0 * s2s0_x + (Sint64)w1 * s2s1_x + s2_x_area.x, area, reciprocal); \
+    int srcy = triangle_divide((Sint64)w0 * s2s0_y + (Sint64)w1 * s2s1_y + s2_x_area.y, area, reciprocal);
 
 #define TRIANGLE_GET_MAPPED_COLOR                                                      \
-    int r = (int)(((Sint64)w0 * c0.r + (Sint64)w1 * c1.r + (Sint64)w2 * c2.r) / area); \
-    int g = (int)(((Sint64)w0 * c0.g + (Sint64)w1 * c1.g + (Sint64)w2 * c2.g) / area); \
-    int b = (int)(((Sint64)w0 * c0.b + (Sint64)w1 * c1.b + (Sint64)w2 * c2.b) / area); \
-    int a = (int)(((Sint64)w0 * c0.a + (Sint64)w1 * c1.a + (Sint64)w2 * c2.a) / area); \
+    int r = triangle_divide((Sint64)w0 * c0.r + (Sint64)w1 * c1.r + (Sint64)w2 * c2.r, area, reciprocal); \
+    int g = triangle_divide((Sint64)w0 * c0.g + (Sint64)w1 * c1.g + (Sint64)w2 * c2.g, area, reciprocal); \
+    int b = triangle_divide((Sint64)w0 * c0.b + (Sint64)w1 * c1.b + (Sint64)w2 * c2.b, area, reciprocal); \
+    int a = triangle_divide((Sint64)w0 * c0.a + (Sint64)w1 * c1.a + (Sint64)w2 * c2.a, area, reciprocal); \
     int color = SDL_MapRGBA(format, r, g, b, a);
 
 #define TRIANGLE_GET_COLOR                                                             \
-    int r = (int)(((Sint64)w0 * c0.r + (Sint64)w1 * c1.r + (Sint64)w2 * c2.r) / area); \
-    int g = (int)(((Sint64)w0 * c0.g + (Sint64)w1 * c1.g + (Sint64)w2 * c2.g) / area); \
-    int b = (int)(((Sint64)w0 * c0.b + (Sint64)w1 * c1.b + (Sint64)w2 * c2.b) / area); \
-    int a = (int)(((Sint64)w0 * c0.a + (Sint64)w1 * c1.a + (Sint64)w2 * c2.a) / area);
+    int r = triangle_divide((Sint64)w0 * c0.r + (Sint64)w1 * c1.r + (Sint64)w2 * c2.r, area, reciprocal); \
+    int g = triangle_divide((Sint64)w0 * c0.g + (Sint64)w1 * c1.g + (Sint64)w2 * c2.g, area, reciprocal); \
+    int b = triangle_divide((Sint64)w0 * c0.b + (Sint64)w1 * c1.b + (Sint64)w2 * c2.b, area, reciprocal); \
+    int a = triangle_divide((Sint64)w0 * c0.a + (Sint64)w1 * c1.a + (Sint64)w2 * c2.a, area, reciprocal);
 
 #define TRIANGLE_END_LOOP \
     }                     \
@@ -211,6 +227,7 @@ int SDL_SW_FillTriangle(SDL_Surface *dst, SDL_Point *d0, SDL_Point *d1, SDL_Poin
     int dst_pitch;
 
     int area, is_clockwise;
+    Uint32 reciprocal;
 
     int d2d1_y, d1d2_x, d0d2_y, d2d0_x, d1d0_y, d0d1_x;
     int w0_row, w1_row, w2_row;
@@ -297,6 +314,7 @@ int SDL_SW_FillTriangle(SDL_Surface *dst, SDL_Point *d0, SDL_Point *d1, SDL_Poin
 
     is_clockwise = area > 0;
     area = SDL_abs(area);
+    reciprocal = (Uint32)(((Uint64)1 << 32) / (Uint32)area);
 
     d2d1_y = (d1->y - d2->y) << FP_BITS;
     d0d2_y = (d2->y - d0->y) << FP_BITS;
@@ -454,6 +472,7 @@ int SDL_SW_BlitTriangle(
     int src_pitch;
 
     int area, is_clockwise;
+    Uint32 reciprocal;
 
     int d2d1_y, d1d2_x, d0d2_y, d2d0_x, d1d0_y, d0d1_x;
     int s2s0_x, s2s1_x, s2s0_y, s2s1_y;
@@ -569,6 +588,7 @@ int SDL_SW_BlitTriangle(
 
     is_clockwise = area > 0;
     area = SDL_abs(area);
+    reciprocal = (Uint32)(((Uint64)1 << 32) / (Uint32)area);
 
     d2d1_y = (d1->y - d2->y) << FP_BITS;
     d0d2_y = (d2->y - d0->y) << FP_BITS;
@@ -756,19 +776,77 @@ static void SDL_BlitTriangle_Slow(SDL_BlitInfo *info,
     int dstfmt_val;
     Uint32 rgbmask = ~src_fmt->Amask;
     Uint32 ckey = info->colorkey & rgbmask;
+    const Uint32 reciprocal = (Uint32)(((Uint64)1 << 32) / (Uint32)area);
+    const SDL_bool constant_uv = (s2s0_x == 0 && s2s1_x == 0 && s2s0_y == 0 && s2s1_y == 0);
+    Uint8 *constant_src = NULL;
 
     Uint8 *dst_ptr = info->dst;
     int dst_pitch = info->dst_pitch;
 
     srcfmt_val = detect_format(src_fmt);
     dstfmt_val = detect_format(dst_fmt);
+    if (constant_uv) {
+        constant_src = info->src + (s2_x_area.y / area) * info->src_pitch + (s2_x_area.x / area) * srcbpp;
+    }
+
+    /* Nuklear represents solid shapes using the white texel in its atlas.
+     * Avoid the generic texture/format/modulation machinery for this very
+     * common case. Keep the original barycentric/top-left coverage and the
+     * exact SDL RGB565 expansion and /255 blend rounding. */
+    if (constant_uv && srcbpp == 4 && src_fmt->Amask == 0xff000000u &&
+        *(const Uint32 *)constant_src == 0xffffffffu &&
+        dst_fmt->format == SDL_PIXELFORMAT_RGB565 &&
+        !(flags & (SDL_COPY_COLORKEY | SDL_COPY_ADD | SDL_COPY_MOD | SDL_COPY_MUL))) {
+        const SDL_bool blend = (flags & SDL_COPY_BLEND) != 0;
+        const Uint8 *expand5 = SDL_expand_byte[3];
+        const Uint8 *expand6 = SDL_expand_byte[2];
+
+        if (is_uniform && (!blend || c0.a == 255)) {
+            const Uint16 pixel = (Uint16)(((Uint16)(c0.r >> 3) << 11) |
+                                         ((Uint16)(c0.g >> 2) << 5) | (c0.b >> 3));
+            TRIANGLE_BEGIN_LOOP
+            {
+                *(Uint16 *)dptr = pixel;
+            }
+            TRIANGLE_END_LOOP
+        } else {
+            TRIANGLE_BEGIN_LOOP
+            {
+                Uint32 red = c0.r, green = c0.g, blue = c0.b, alpha = c0.a;
+                if (!is_uniform) {
+                    if (c0.r != c1.r || c0.r != c2.r)
+                        red = triangle_divide((Sint64)w0 * c0.r + (Sint64)w1 * c1.r + (Sint64)w2 * c2.r, area, reciprocal);
+                    if (c0.g != c1.g || c0.g != c2.g)
+                        green = triangle_divide((Sint64)w0 * c0.g + (Sint64)w1 * c1.g + (Sint64)w2 * c2.g, area, reciprocal);
+                    if (c0.b != c1.b || c0.b != c2.b)
+                        blue = triangle_divide((Sint64)w0 * c0.b + (Sint64)w1 * c1.b + (Sint64)w2 * c2.b, area, reciprocal);
+                    if (c0.a != c1.a || c0.a != c2.a)
+                        alpha = triangle_divide((Sint64)w0 * c0.a + (Sint64)w1 * c1.a + (Sint64)w2 * c2.a, area, reciprocal);
+                }
+                if (blend && alpha < 255) {
+                    const Uint16 old = *(Uint16 *)dptr;
+                    const Uint32 inverse = 255 - alpha;
+                    red = red * alpha / 255 + inverse * expand5[old >> 11] / 255;
+                    green = green * alpha / 255 + inverse * expand6[(old >> 5) & 63] / 255;
+                    blue = blue * alpha / 255 + inverse * expand5[old & 31] / 255;
+                }
+                *(Uint16 *)dptr = (Uint16)(((red >> 3) << 11) | ((green >> 2) << 5) | (blue >> 3));
+            }
+            TRIANGLE_END_LOOP
+        }
+        return;
+    }
 
     TRIANGLE_BEGIN_LOOP
     {
         Uint8 *src;
         Uint8 *dst = dptr;
-        TRIANGLE_GET_TEXTCOORD
-        src = (info->src + (srcy * info->src_pitch) + (srcx * srcbpp));
+        if (constant_uv) {
+            src = constant_src;
+        } else {
+            TRIANGLE_GET_TEXTCOORD
+            src = (info->src + (srcy * info->src_pitch) + (srcx * srcbpp));
+        }
         if (FORMAT_HAS_ALPHA(srcfmt_val)) {
             DISEMBLE_RGBA(src, srcbpp, src_fmt, srcpixel, srcR, srcG, srcB, srcA);
         } else if (FORMAT_HAS_NO_ALPHA(srcfmt_val)) {
