@@ -1,35 +1,36 @@
+[English](README.md) | [Русский](README.ru.md)
+
 # SDL2-RGA
 
-Форк **SDL 2.28.5** с дополнительным аппаратно-ускоренным renderer на базе
-Rockchip RGA. Проект ориентирован на **PicoCalc / Lyra B** и другие Linux-
-устройства с Rockchip RGA, `librga` и DMA heap.
+A fork of **SDL 2.28.5** with an optional hardware-accelerated renderer built
+on Rockchip RGA. The project is primarily intended for **PicoCalc / Lyra B**
+and other Linux devices with Rockchip RGA, `librga`, and a DMA heap.
 
-SDL — кроссплатформенная библиотека для работы с графикой, аудио, клавиатурой,
-мышью, контроллерами и другими устройствами ввода. Изменения этого форка
-добавляют renderer `rga` к API `SDL_Renderer`; базовые API и программный
-renderer SDL2 остаются доступны.
+SDL is a cross-platform library for graphics, audio, keyboard, mouse,
+controllers, and other input devices. This fork adds an `rga` renderer to the
+`SDL_Renderer` API while keeping SDL2's standard APIs and software renderer
+available.
 
 ## RGA renderer
 
-Renderer использует DMA-буферы для совместного доступа CPU и RGA. На Lyra B
-окно и вывод на экран обслуживает DirectFB, а графические RGA-операции
-выполняются самим SDL renderer.
+The renderer uses DMA buffers shared by the CPU and RGA. On Lyra B, DirectFB
+provides the window and display output, while RGA operations are performed by
+the SDL renderer itself.
 
-Аппаратно ускоряются подходящие операции очистки, заливки прямоугольников,
-копирования текстур, линейного масштабирования, поворота на 90°/180°/270° при
-поддерживаемых размере и центре, а также отражения. Поддерживаются, в частности,
-текстуры RGB565 и ARGB8888. Операции, которые не подходят для RGA, продолжают
-выполняться программным renderer SDL.
+Supported operations can be accelerated in hardware, including clearing,
+rectangle fills, texture copies, linear scaling, supported 90°/180°/270°
+rotations, and flips. RGB565 and ARGB8888 textures are supported. Operations
+that are not suitable for RGA continue through SDL's software renderer.
 
-RGA — 2D blitter, а не GPU для произвольной геометрии: точки, линии,
-треугольники, произвольные углы поворота и неподдерживаемые режимы смешивания
-обрабатываются программным путём. Максимальный размер RGA-буфера — 1280 × 1280.
+RGA is a 2D blitter, not a GPU for arbitrary geometry. Points, lines,
+triangles, arbitrary-angle rotations, and unsupported blend modes are handled
+in software. The maximum RGA buffer size is 1280 × 1280.
 
-## Сборка
+## Build
 
-Для включения renderer нужны Linux, CMake, заголовки Rockchip RGA и библиотека
-`librga`. Для вывода через DirectFB также нужны его заголовки и библиотека.
-Пример сборки для Linux-устройства с DirectFB:
+RGA support requires Linux, CMake, the Rockchip RGA headers, and `librga`.
+DirectFB headers and libraries are also required when using DirectFB for display
+output. Example build for a Linux device with DirectFB:
 
 ```sh
 cmake -S . -B build \
@@ -39,7 +40,7 @@ cmake -S . -B build \
 cmake --build build --parallel
 ```
 
-Укажите renderer до его создания:
+Select the renderer before creating it:
 
 ```c
 SDL_SetHint(SDL_HINT_RENDER_DRIVER, "rga");
@@ -47,21 +48,20 @@ SDL_Renderer *renderer = SDL_CreateRenderer(
     window, -1, SDL_RENDERER_ACCELERATED);
 ```
 
-Для Lyra B с DirectFB можно запускать приложение так:
+On Lyra B with DirectFB, launch an application with:
 
 ```sh
 SDL_VIDEODRIVER=directfb ./your_app
 ```
 
-Для диагностики доступны подсказки `SDL_RGA_STATS=1` (счётчики аппаратных
-операций), `SDL_RGA_FORCE=1` (форсирование допустимого аппаратного пути) и
-`SDL_RGA_CACHE=0` (отключение кэша масштабирования). Задавайте их до создания
-renderer.
+Diagnostic hints include `SDL_RGA_STATS=1` (hardware operation counters),
+`SDL_RGA_FORCE=1` (force eligible hardware operations), and `SDL_RGA_CACHE=0`
+(disable the scaling cache). Set them before creating the renderer.
 
-## Документация
+## Documentation
 
-- [Подробности реализации, сборка и проверки на PicoCalc / Lyra B](README-Lyra-RGA.md)
-- [Документация SDL2 и платформ](docs/README.md)
-- [Лицензия](LICENSE.txt)
+- [Detailed implementation, build, and hardware testing notes (Russian)](README-Lyra-RGA.md)
+- [SDL2 and platform documentation](docs/README.md)
+- [License](LICENSE.txt)
 
-Изменения SDL2 основаны на upstream-теге [`release-2.28.5`](https://github.com/libsdl-org/SDL/releases/tag/release-2.28.5).
+This fork is based on the upstream [`release-2.28.5`](https://github.com/libsdl-org/SDL/releases/tag/release-2.28.5) tag.
